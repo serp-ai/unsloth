@@ -1,4 +1,4 @@
-This fork is for adding [sparsetral](https://huggingface.co/serpdotai/sparsetral-16x7B-v1) support (not fully optimized yet, but currently seeing nice speedups and memory improvements)
+This fork is for adding [sparsetral](https://huggingface.co/serpdotai/sparsetral-16x7B-v1) ([repo](https://github.com/serp-ai/Parameter-Efficient-MoE)) support (not fully optimized yet, but currently seeing nice speedups and memory improvements)
 
 ---
 # Original README
