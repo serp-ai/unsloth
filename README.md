@@ -1,3 +1,7 @@
+This fork is for adding [sparsetral](https://huggingface.co/serpdotai/sparsetral-16x7B-v1) support (not fully optimized yet, but currently seeing nice speedups and memory improvements)
+
+---
+# Original README
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shimmyshimmer/unsloth/main/images/unsloth%20logo%20white%20text.png">
