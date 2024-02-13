@@ -948,6 +948,9 @@ class FastSparsetralModel(FastLlamaModel):
             "gate_proj",
             "up_proj",
             "down_proj",
+            "adapter_down",
+            "adapter_up",
+            # "router",
         ],
         lora_alpha=16,
         lora_dropout=0,
@@ -1055,6 +1058,9 @@ class FastSparsetralModel(FastLlamaModel):
                 "gate_proj",
                 "up_proj",
                 "down_proj",
+                "adapter_down",
+                "adapter_up",
+                "router",
             ),
         )
         model.config.update({"unsloth_version": __version__})
