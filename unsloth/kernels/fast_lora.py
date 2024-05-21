@@ -13,33 +13,7 @@
 # limitations under the License.
 
 import torch
-from .utils import fast_dequantize, QUANT_STATE, get_lora_parameters
-from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
-
-
-def matmul_lora(X, W, W_quant, A, B, s, out = None):
-    dtype = X.dtype
-    W = fast_dequantize(W.t(), W_quant)
-
-    if X.dim() == 3:
-        batch, seq_len, d = X.shape
-        X = X.view(-1, X.shape[-1])
-        reshape = True
-    else:
-        reshape = False
-    pass
-
-    out = torch.matmul(X, W, out = out)
-    if W_quant is not None: del W
-
-    if A is not None:
-        # LoRA is enabled
-        A, B = A.t(), B.t()
-        out += (X @ A.to(dtype)) @ (s * B.to(dtype))
-    pass
-    
-    return out.view(batch, seq_len, -1) if reshape else out
-pass
+from .utils import fast_dequantize, QUANT_STATE, get_lora_parameters, matmul_lora
 
 
 class LoRA_MLP(torch.autograd.Function):
@@ -85,20 +59,20 @@ class LoRA_MLP(torch.autograd.Function):
     def forward(ctx, X : torch.Tensor,
                 gateW, gateW_quant, gateA, gateB, gateS,
                   upW,   upW_quant, upA,   upB,   upS,
-                downW, downW_quant, downA, downB, downS):
+                downW, downW_quant, downA, downB, downS,
+                _forward_function, _backward_function,):
         dtype = X.dtype
 
         e = matmul_lora(X, gateW, gateW_quant, gateA, gateB, gateS)
         g = matmul_lora(X,   upW,   upW_quant,   upA,   upB,   upS)
-        # f = torch.nn.functional.silu(e)
-        # h = f * g
-        h = swiglu_fg_kernel(e, g)
+        h = _forward_function(e, g)
         i = matmul_lora(h, downW, downW_quant, downA, downB, downS)
 
         ctx.custom_saved_tensors = (
             gateW, gateW_quant, gateS,
             upW, upW_quant, upS,
             downW, downW_quant, downS,
+            _backward_function,
         )
         ctx.save_for_backward(gateA, gateB, upA, upB, downA, downB,
                               X, e, g)
@@ -109,8 +83,8 @@ class LoRA_MLP(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_bwd
     def backward(ctx, dY : torch.Tensor):
-        gateW, gateW_quant, gateS, upW, upW_quant, upS, downW, downW_quant, downS, = \
-            ctx.custom_saved_tensors
+        gateW, gateW_quant, gateS, upW, upW_quant, upS, downW, downW_quant, downS, \
+            _backward_function = ctx.custom_saved_tensors
         gateA, gateB, upA, upB, downA, downB, \
             X, e, g = ctx.saved_tensors
 
@@ -125,14 +99,7 @@ class LoRA_MLP(torch.autograd.Function):
         dtype = X.dtype
 
         DW = matmul_lora(dY, downW.t(), downW_quant, downB, downA, downS)
-        # e = e.float()
-        # se = 1.0 / (1.0 + torch.exp(-e))
-        # f = (se * e).to(dtype)
-        # h = f * g
-        # df = DW * f
-        # dg = DW * g
-        # de = (dg.float() * se * (1.0 + e * (1.0 - se))).to(dtype)
-        DW, e, g = swiglu_DWf_DW_dfg_kernel(DW, e, g)
+        DW, e, g = _backward_function(DW, e, g)
         h, df, de = DW, e, g
 
         # Down projection LoRA weights
@@ -155,7 +122,6 @@ class LoRA_MLP(torch.autograd.Function):
 
         # dX  = matmul_lora(df, upW.t(), upW_quant, upB, upA, upS)
         # dX += matmul_lora(de, gateW.t(), gateW_quant, gateB, gateA, gateS)
-
         upW = fast_dequantize(upW.t(), upW_quant)
         dX = torch.matmul(df, upW.t(), out = X)
         del upW
@@ -172,24 +138,50 @@ class LoRA_MLP(torch.autograd.Function):
         return dX.view(batch, seq_len, hd), \
             None, None, d_gateA.t(), d_gateB.t(), None, \
             None, None,   d_upA.t(),   d_upB.t(), None, \
-            None, None, d_downA.t(), d_downB.t(), None,
+            None, None, d_downA.t(), d_downB.t(), None, \
+            None, None, # _backward and _forward
     pass
 pass
 
 
-def apply_lora_mlp(self, X):
-    # gate = self.gate_proj(X)
-    # up   = self.  up_proj(X)
-    # h = torch.nn.functional.silu(gate) * up
-    # down = self.down_proj(h)
-    # return down
+from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
+def apply_lora_mlp_swiglu(self, X):
     gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
     upW,     upW_quant,   upA,   upB,   upS = get_lora_parameters(self.  up_proj)
     downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
     out = LoRA_MLP.apply(X,
                          gateW, gateW_quant, gateA, gateB, gateS,
                          upW,     upW_quant, upA,   upB,   upS,
-                         downW, downW_quant, downA, downB, downS)
+                         downW, downW_quant, downA, downB, downS,
+                         swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel,)
+    return out
+pass
+
+
+from .geglu import geglu_exact_forward_kernel, geglu_exact_backward_kernel
+def apply_lora_mlp_geglu_exact(self, X):
+    gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
+    upW,     upW_quant,   upA,   upB,   upS = get_lora_parameters(self.  up_proj)
+    downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
+    out = LoRA_MLP.apply(X,
+                         gateW, gateW_quant, gateA, gateB, gateS,
+                         upW,     upW_quant, upA,   upB,   upS,
+                         downW, downW_quant, downA, downB, downS,
+                         geglu_exact_forward_kernel, geglu_exact_backward_kernel,)
+    return out
+pass
+
+
+from .geglu import geglu_approx_forward_kernel, geglu_approx_backward_kernel
+def apply_lora_mlp_geglu_approx(self, X):
+    gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
+    upW,     upW_quant,   upA,   upB,   upS = get_lora_parameters(self.  up_proj)
+    downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
+    out = LoRA_MLP.apply(X,
+                         gateW, gateW_quant, gateA, gateB, gateS,
+                         upW,     upW_quant, upA,   upB,   upS,
+                         downW, downW_quant, downA, downB, downS,
+                         geglu_approx_forward_kernel, geglu_approx_backward_kernel,)
     return out
 pass
 
