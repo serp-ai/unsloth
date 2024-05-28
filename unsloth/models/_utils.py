@@ -35,7 +35,10 @@ __version__ = "2024.5"
 
 # Get Flash Attention v2 if Ampere (RTX 30xx, A100)
 major_version, minor_version = torch.cuda.get_device_capability()
+SUPPORTS_BFLOAT16 = False
+
 if major_version >= 8:
+    SUPPORTS_BFLOAT16 = True
     try:
         from flash_attn import flash_attn_func
         # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl"
@@ -72,6 +75,10 @@ __all__ = [
     "patch_tokenizer",
     "get_statistics",
     "Unsloth_Offloaded_Gradient_Checkpointer",
+    "offload_to_disk",
+    "offload_input_embeddings",
+    "offload_output_embeddings",
+    "is_bfloat16_supported",
 ]
 
 
@@ -152,7 +159,7 @@ def patch_tokenizer(model, tokenizer):
         Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
         Fixes https://github.com/unslothai/unsloth/issues/5
     """
-    possible_reserved_tokens = ("<|reserved", "<|placeholder",)
+    possible_reserved_tokens = ("<|reserved", "<|placeholder", "[control")
 
     if model is not None:
         model.config.update({"unsloth_version" : __version__})
@@ -171,12 +178,17 @@ def patch_tokenizer(model, tokenizer):
         # Find a better pad token
         added_tokens = [str(x) for x in tokenizer.added_tokens_decoder.values()]
         possible_pad_token = None
+        n_possible_pad_tokens = 0
         for added_token in added_tokens[::-1]:
             if added_token.startswith(possible_reserved_tokens):
-                possible_pad_token = added_token
-                break
+                if possible_pad_token is None: possible_pad_token = added_token
+                n_possible_pad_tokens += 1
+                # We must see at least 3 of the reserved tokens
+                if n_possible_pad_tokens >= 3: break
             pass
         pass
+        if n_possible_pad_tokens < 3: possible_pad_token = None
+
         if possible_pad_token is None:
             # Try unk_token
             possible_pad_token = tokenizer.unk_token
@@ -420,4 +432,53 @@ except:
         "Unsloth unsuccessfully patched bitsandbytes. Please file a bug report.\n"\
         "Luckily, your training run will still work in the meantime!"
     )
+pass
+
+
+# Offloading to disk for modules (lm_head, embed_tokens)
+import os
+import pickle
+
+def offload_to_disk(W, model, name, temporary_location : str = "_unsloth_temporary_saved_buffers"):
+    file_location = os.path.join(temporary_location, model.config._name_or_path)
+    if not os.path.exists(file_location):
+        os.makedirs(file_location)
+    pass
+
+    filename = os.path.join(file_location, f"{name}.pt")
+    W = W.weight if hasattr(W, "weight") else W
+    torch.save(W, filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL,)
+    offloaded_W = torch.load(filename, map_location = "cpu", mmap = True)
+    offloaded_W._offloaded_file_location = filename
+    return offloaded_W
+pass
+
+
+def offload_input_embeddings(model, temporary_location : str = "_unsloth_temporary_saved_buffers"):
+    offloaded_W = offload_to_disk(model.get_input_embeddings(), model, "input_embeddings", temporary_location)
+    new_input_embeddings = torch.nn.Embedding.from_pretrained(offloaded_W)
+    new_input_embeddings._offloaded_file_location = offloaded_W._offloaded_file_location
+    model.set_input_embeddings(new_input_embeddings)
+    return
+pass
+
+
+def offload_output_embeddings(model, temporary_location : str = "_unsloth_temporary_saved_buffers"):
+    offloaded_W = offload_to_disk(model.get_output_embeddings(), model, "output_embeddings", temporary_location)
+
+    new_output_embeddings = torch.nn.Linear(1, 1, bias = None)
+    del new_output_embeddings.weight
+    new_output_embeddings.weight = offloaded_W
+    new_output_embeddings.in_features  = offloaded_W.shape[1]
+    new_output_embeddings.out_features = offloaded_W.shape[0]
+
+    new_output_embeddings._offloaded_file_location = offloaded_W._offloaded_file_location
+    model.set_output_embeddings(new_output_embeddings)
+    return
+pass
+
+
+# Fixes a weird Torch 2.3 bug which says T4s have bfloat16
+def is_bfloat16_supported():
+    return SUPPORTS_BFLOAT16
 pass
